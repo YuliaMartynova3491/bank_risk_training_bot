@@ -1,19 +1,39 @@
-# Python
+# Virtual environments
+venv/
+venv_fixed/
+env/
+ENV/
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
-.Python
-venv/
-.env
-*.db
-*.sqlite3
-*.log
-.DS_Store
 
-# AI/ML
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector store data
+data/vector_store/
 ai_agent/rag/data/vectorstore/
-models/
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
+
+# Logs
+*.log
+logs/
+
+# Model files
+*.model
+*.bin
+*.safetensors

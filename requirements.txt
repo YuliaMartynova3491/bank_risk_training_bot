@@ -15,7 +15,7 @@ aioredis==2.0.1
 # AI and ML stack (ваши совместимые версии)
 langchain==0.3.7
 langchain-community==0.3.5
-langchain-core==0.3.63
+langchain-core==0.3.17
 langchain-openai==0.2.8
 langgraph==0.2.39
 langsmith==0.1.147
@@ -85,7 +85,7 @@ loguru==0.7.2
 
 # HTTP and async utilities (ваши проверенные версии)
 aiohttp==3.11.18
-httpx==0.25.2
+httpx==0.27.2
 aiofiles==23.2.1
 tenacity==8.2.3
 

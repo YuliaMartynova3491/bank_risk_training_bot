@@ -1,585 +1,545 @@
 """
-LangGraph агент для адаптивного обучения банковским рискам.
+LangGraph граф для обучения с адаптивной сложностью.
 """
 
 import logging
 from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
-from enum import Enum
+import json
 
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain.schema import Document
+try:
+    from langgraph.graph import StateGraph, END
+    from langgraph.graph.message import add_messages
+    from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+    from typing_extensions import Annotated, TypedDict
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    logging.warning("⚠️ LangGraph недоступен")
+    LANGGRAPH_AVAILABLE = False
 
-from config.settings import settings, DifficultyConfig
+try:
+    from database.database import get_user_by_telegram_id, db_manager
+    from database.models import User
+    from sqlalchemy import select
+    DATABASE_AVAILABLE = True
+except ImportError:
+    logging.warning("⚠️ База данных недоступна для learning_graph")
+    DATABASE_AVAILABLE = False
 
 
-class LearningState(Enum):
-    """Состояния процесса обучения."""
-    ASSESSMENT = "assessment"
-    QUESTION_GENERATION = "question_generation" 
-    QUESTION_PRESENTATION = "question_presentation"
-    ANSWER_EVALUATION = "answer_evaluation"
-    DIFFICULTY_ADAPTATION = "difficulty_adaptation"
-    LESSON_COMPLETION = "lesson_completion"
-    TOPIC_TRANSITION = "topic_transition"
-
-
-@dataclass
-class LearningContext:
-    """Контекст обучения пользователя."""
+class LearningState(TypedDict):
+    """Состояние обучения для LangGraph."""
+    messages: Annotated[List[BaseMessage], add_messages]
     user_id: int
-    current_difficulty: int = 1
-    current_topic_id: Optional[int] = None
-    current_lesson_id: Optional[int] = None
-    questions_answered: int = 0
-    correct_answers: int = 0
-    consecutive_correct: int = 0
-    consecutive_incorrect: int = 0
-    session_history: List[Dict] = None
-    knowledge_gaps: List[str] = None
-    strengths: List[str] = None
-    
-    def __post_init__(self):
-        if self.session_history is None:
-            self.session_history = []
-        if self.knowledge_gaps is None:
-            self.knowledge_gaps = []
-        if self.strengths is None:
-            self.strengths = []
+    current_difficulty: int
+    focus_topics: List[str]
+    question_count: int
+    correct_answers: int
+    current_question: Optional[Dict[str, Any]]
+    session_active: bool
 
 
 class LearningGraph:
-    """Основной класс LangGraph агента для адаптивного обучения."""
+    """Граф обучения на основе LangGraph с адаптивной сложностью."""
     
-    def __init__(self, knowledge_base, llm=None):
+    def __init__(self, knowledge_base=None, llm=None):
         self.knowledge_base = knowledge_base
         self.llm = llm
         self.graph = None
-        self.contexts: Dict[int, LearningContext] = {}
+        self.is_initialized = False
+        
+        # Настройки адаптивности
+        self.min_difficulty = 1
+        self.max_difficulty = 5
+        self.questions_per_session = 10
+        
+        # Темы по уровням сложности
+        self.difficulty_topics = {
+            1: ["basic_concepts", "definitions", "simple_terms"],
+            2: ["risk_identification", "threat_types", "basic_procedures"],
+            3: ["risk_assessment", "impact_analysis", "intermediate_concepts"],
+            4: ["mitigation_strategies", "business_continuity", "advanced_procedures"],
+            5: ["regulatory_compliance", "complex_scenarios", "expert_level"]
+        }
     
-    async def set_llm(self, llm):
-        """Установка LLM после инициализации."""
-        self.llm = llm
-    
-    async def initialize(self):
+    async def initialize(self) -> bool:
         """Инициализация графа обучения."""
-    try:
-        from langgraph.graph import StateGraph, END
-        
-        workflow = StateGraph(dict)
-        
-        # Только необходимые узлы
-        workflow.add_node("assessment", self._assessment_node)
-        workflow.add_node("question_generation", self._question_generation_node)
-        
-        # Простые переходы
-        workflow.add_edge("assessment", "question_generation")
-        workflow.add_edge("question_generation", END)
-        
-        workflow.set_entry_point("assessment")
-        
-        self.graph = workflow.compile()
-        
-        logging.info("✅ LangGraph агент инициализирован")
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка инициализации LangGraph: {e}")
-        raise
-    
-    async def start_learning_session(self, user_id: int, topic_id: int = None) -> Dict[str, Any]:
-        """Начало новой сессии обучения."""
         try:
-            # Создание или обновление контекста
-            if user_id not in self.contexts:
-                self.contexts[user_id] = LearningContext(user_id=user_id)
+            if not LANGGRAPH_AVAILABLE:
+                logging.warning("⚠️ LangGraph недоступен - используется упрощенный режим")
+                self.is_initialized = True
+                return True
             
-            context = self.contexts[user_id]
-            context.current_topic_id = topic_id
-            context.questions_answered = 0
-            context.correct_answers = 0
+            # Создаем граф состояний
+            workflow = StateGraph(LearningState)
             
-            # Запуск графа
-            initial_state = {
-                "user_id": user_id,
-                "context": context,
-                "action": "start_session"
-            }
+            # Добавляем узлы (ИСПРАВЛЕНО: убираем недостижимые узлы)
+            workflow.add_node("assess_user", self.assess_user_level)
+            workflow.add_node("generate_question", self.generate_question)
+            workflow.add_node("check_completion", self.check_session_completion)
             
-            result = await self.graph.ainvoke(initial_state)
-            return result
+            # Добавляем простые рёбра (ИСПРАВЛЕНО: простая структура)
+            workflow.set_entry_point("assess_user")
+            workflow.add_edge("assess_user", "generate_question")
+            workflow.add_edge("generate_question", "check_completion")
+            workflow.add_edge("check_completion", END)
             
+            # Компилируем граф
+            self.graph = workflow.compile()
+            self.is_initialized = True
+            
+            logging.info("✅ LangGraph агент инициализирован")
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ Ошибка инициализации LangGraph: {e}")
+            # Включаем упрощенный режим
+            self.is_initialized = True
+            return True
+    
+    async def start_learning_session(
+        self, 
+        user_id: int, 
+        difficulty_override: Optional[int] = None,
+        focus_topics: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Запуск новой сессии обучения."""
+        try:
+            if not self.is_initialized:
+                await self.initialize()
+            
+            # Получаем уровень пользователя
+            user_difficulty = await self.get_user_difficulty(user_id)
+            current_difficulty = difficulty_override or user_difficulty
+            
+            # Определяем темы для фокуса
+            if not focus_topics:
+                focus_topics = self.difficulty_topics.get(current_difficulty, ["basic_concepts"])
+            
+            logging.info(f"👤 Оценка пользователя {user_id}: уровень {current_difficulty}")
+            
+            if LANGGRAPH_AVAILABLE and self.graph:
+                # Используем LangGraph
+                initial_state = LearningState(
+                    messages=[],
+                    user_id=user_id,
+                    current_difficulty=current_difficulty,
+                    focus_topics=focus_topics,
+                    question_count=0,
+                    correct_answers=0,
+                    current_question=None,
+                    session_active=True
+                )
+                
+                result = await self.graph.ainvoke(initial_state)
+                
+                if result.get("current_question"):
+                    return {
+                        "success": True,
+                        "generated_question": result["current_question"],
+                        "difficulty": result["current_difficulty"],
+                        "focus_topics": result["focus_topics"]
+                    }
+                else:
+                    return {"error": "Не удалось сгенерировать вопрос через LangGraph"}
+            else:
+                # Упрощенный режим без LangGraph
+                return await self.generate_simple_question(user_id, current_difficulty, focus_topics)
+                
         except Exception as e:
             logging.error(f"❌ Ошибка запуска сессии обучения: {e}")
             return {"error": str(e)}
     
-    async def process_answer(self, user_id: int, question_id: int, answer: str) -> Dict[str, Any]:
-        """Обработка ответа пользователя."""
-        try:
-            if user_id not in self.contexts:
-                return {"error": "Сессия не найдена"}
-            
-            context = self.contexts[user_id]
-            
-            # Прямая обработка ответа без LangGraph для избежания рекурсии
-            return await self._process_answer_direct(context, answer)
-            
-        except Exception as e:
-            logging.error(f"❌ Ошибка обработки ответа: {e}")
-            return {"error": str(e)}
-    
-    async def _process_answer_direct(self, context: LearningContext, answer: str) -> Dict[str, Any]:
-        """Прямая обработка ответа без LangGraph."""
-        try:
-            # Предполагаем что у нас есть текущий вопрос в контексте
-            if not hasattr(context, 'current_question'):
-                return {"error": "Нет текущего вопроса"}
-            
-            question_data = context.current_question
-            user_answer_index = int(answer) if answer.isdigit() else -1
-            correct_answer_index = question_data.get("correct_answer", 0)
-            
-            is_correct = user_answer_index == correct_answer_index
-            
-            # Обновление контекста
-            context.questions_answered += 1
-            if is_correct:
-                context.correct_answers += 1
-                context.consecutive_correct += 1
-                context.consecutive_incorrect = 0
-            else:
-                context.consecutive_incorrect += 1
-                context.consecutive_correct = 0
-            
-            # Генерация обратной связи
-            if is_correct:
-                feedback = f"✅ Правильно! {question_data.get('explanation', '')}"
-            else:
-                correct_option = question_data.get('options', [])[correct_answer_index] if correct_answer_index < len(question_data.get('options', [])) else "Неизвестно"
-                feedback = f"❌ Неправильно. Правильный ответ: {correct_option}\n\n💡 {question_data.get('explanation', '')}"
-            
-            # Адаптация сложности
-            adaptation_made = False
-            if context.consecutive_correct >= 2 and context.current_difficulty < 5:
-                context.current_difficulty = min(context.current_difficulty + 1, 5)
-                adaptation_made = True
-                feedback += f"\n\n🎯 Уровень повышен до {context.current_difficulty}!"
-            elif context.consecutive_incorrect >= 2 and context.current_difficulty > 1:
-                context.current_difficulty = max(context.current_difficulty - 1, 1)
-                adaptation_made = True
-                feedback += f"\n\n📚 Уровень понижен до {context.current_difficulty} для лучшего усвоения"
-            
-            # Проверка завершения урока
-            if context.questions_answered >= settings.questions_per_lesson:
-                success_rate = context.correct_answers / context.questions_answered * 100
-                lesson_passed = success_rate >= settings.min_lesson_score
+    async def get_user_difficulty(self, user_id: int) -> int:
+        """Получение текущего уровня сложности пользователя."""
+        if DATABASE_AVAILABLE:
+            try:
+                # ИСПРАВЛЕНО: получаем пользователя по Telegram ID, а не по внутреннему ID
+                from database.database import db_manager
+                from database.models import User
                 
-                completion_data = {
-                    "lesson_passed": lesson_passed,
-                    "success_rate": success_rate,
-                    "questions_answered": context.questions_answered,
-                    "correct_answers": context.correct_answers,
-                    "final_difficulty": context.current_difficulty
-                }
-                
-                return {
-                    "is_correct": is_correct,
-                    "feedback": feedback,
-                    "completion_data": completion_data
-                }
-            
-            return {
-                "is_correct": is_correct,
-                "feedback": feedback,
-                "adaptation_made": adaptation_made,
-                "current_difficulty": context.current_difficulty
-            }
-            
-        except Exception as e:
-            logging.error(f"❌ Ошибка прямой обработки ответа: {e}")
-            return {"error": str(e)}
-    
-    # Узлы графа
-    async def _assessment_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел оценки текущего уровня знаний пользователя."""
-        try:
-            context: LearningContext = state["context"]
-            
-            # Получение истории ответов пользователя
-            from database.database import db_manager
-            from database.models import QuestionAttempt
-            from sqlalchemy import select, desc
-            
-            async with db_manager.get_session() as session:
-                # Получаем последние ответы для анализа
-                recent_attempts = await session.execute(
-                    select(QuestionAttempt)
-                    .where(QuestionAttempt.user_id == context.user_id)
-                    .order_by(desc(QuestionAttempt.created_at))
-                    .limit(10)
-                )
-                attempts = recent_attempts.scalars().all()
-            
-            # Анализ производительности
-            if attempts:
-                correct_rate = sum(1 for a in attempts if a.is_correct) / len(attempts)
-                
-                # Адаптация сложности на основе результатов
-                if correct_rate >= 0.8 and context.current_difficulty < 5:
-                    context.current_difficulty = min(context.current_difficulty + 1, 5)
-                elif correct_rate <= 0.4 and context.current_difficulty > 1:
-                    context.current_difficulty = max(context.current_difficulty - 1, 1)
-            
-            state["assessment_complete"] = True
-            state["recommended_difficulty"] = context.current_difficulty
-            
-            logging.info(f"👤 Оценка пользователя {context.user_id}: уровень {context.current_difficulty}")
-            
-            return state
-            
-        except Exception as e:
-            logging.error(f"❌ Ошибка в узле оценки: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _question_generation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел генерации адаптивных вопросов."""
-        try:
-            context: LearningContext = state["context"]
-            
-            # Поиск подходящего контента в базе знаний
-            difficulty_keywords = {
-                1: ["основы", "что такое", "определение"],
-                2: ["процедуры", "как", "методы"],
-                3: ["анализ", "оценка", "сценарии"],
-                4: ["расчет", "формула", "сложные"],
-                5: ["экспертные", "принятие решений", "комплексные"]
-            }
-            
-            keywords = difficulty_keywords.get(context.current_difficulty, ["основы"])
-            search_query = f"банковские риски {' '.join(keywords[:2])}"
-            
-            # Поиск релевантного контента
-            relevant_docs = await self.knowledge_base.search(search_query, limit=3)
-            
-            if not relevant_docs:
-                state["error"] = "Контент для генерации вопроса не найден"
-                return state
-            
-            # ИСПРАВЛЕНИЕ: Определяем context_text ЗДЕСЬ
-            context_text = "\n".join([doc.page_content for doc in relevant_docs])
-            
-            # Попытка генерации через LLM
-            if self.llm:
-                try:
-                    # Формирование промпта для генерации вопроса (оптимизировано для Qwen2.5)
-                    from ai_agent.llm.prompts.qwen_prompts import QwenPrompts
-                    
-                    question_prompt = QwenPrompts.QUESTION_GENERATOR.format(
-                        difficulty=context.current_difficulty,
-                        topic="банковские риски непрерывности",
-                        context=context_text
+                async with db_manager.get_session() as session:
+                    user_result = await session.execute(
+                        select(User).where(User.telegram_id == user_id)
                     )
+                    user = user_result.scalar_one_or_none()
                     
-                    # Генерация вопроса через LLM
-                    from langchain_core.messages import HumanMessage, SystemMessage
-                    
-                    messages = [
-                        SystemMessage(content=QwenPrompts.SYSTEM_EXPERT),
-                        HumanMessage(content=question_prompt)
-                    ]
-                    
-                    response = await self.llm.ainvoke(messages)
-                    
-                    # Парсинг JSON ответа
-                    import json
-                    try:
-                        # Очистка ответа от лишних символов
-                        response_content = response.content.strip()
-                        if response_content.startswith("```json"):
-                            response_content = response_content[7:-3]
-                        elif response_content.startswith("```"):
-                            response_content = response_content[3:-3]
+                    if user:
+                        level = user.current_difficulty_level
+                        logging.info(f"📊 Получен уровень пользователя {user_id}: {level}")
+                        return level
+                    else:
+                        logging.warning(f"⚠️ Пользователь {user_id} не найден в БД")
                         
-                        question_data = json.loads(response_content)
-                        state["generated_question"] = question_data
-                        state["question_context"] = context_text
-                        
-                        logging.info(f"❓ Сгенерирован вопрос для пользователя {context.user_id}")
-                        return state
-                        
-                    except json.JSONDecodeError:
-                        logging.warning("⚠️ Ошибка парсинга JSON от LLM, используем фаллбек")
-                        # Фаллбек к простому вопросу
-                        pass
-                        
-                except Exception as e:
-                    logging.warning(f"⚠️ Ошибка LLM: {e}, используем фаллбек")
+            except Exception as e:
+                logging.warning(f"⚠️ Ошибка получения уровня пользователя: {e}")
+        
+        logging.info(f"📊 Используем начальный уровень для пользователя {user_id}: 1")
+        return 1  # Начальный уровень по умолчанию
+    
+    async def assess_user_level(self, state: LearningState) -> LearningState:
+        """Оценка уровня пользователя."""
+        try:
+            # Логика оценки уже выполнена в start_learning_session
+            return state
+        except Exception as e:
+            logging.error(f"❌ Ошибка оценки пользователя: {e}")
+            return state
+    
+    async def generate_question(self, state: LearningState) -> LearningState:
+        """Генерация вопроса через LLM."""
+        try:
+            difficulty = state["current_difficulty"]
+            focus_topics = state["focus_topics"]
             
-            # Фаллбек - используем простой вопрос
-            state["generated_question"] = self._create_fallback_question(context.current_difficulty)
-            state["question_context"] = context_text
+            # Получаем контекст из базы знаний
+            context = await self.get_context_for_difficulty(difficulty, focus_topics)
             
-            logging.info(f"❓ Использован фаллбек вопрос для пользователя {context.user_id}")
+            # Генерируем вопрос через LLM
+            question_data = await self.generate_question_with_llm(difficulty, context, focus_topics)
+            
+            if question_data:
+                state["current_question"] = question_data
+                logging.info(f"❓ Сгенерирован вопрос для пользователя {state['user_id']}")
             
             return state
             
         except Exception as e:
             logging.error(f"❌ Ошибка генерации вопроса: {e}")
-            state["error"] = str(e)
             return state
     
-    async def _answer_evaluation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел оценки ответа пользователя."""
+    async def get_context_for_difficulty(self, difficulty: int, focus_topics: List[str]) -> str:
+        """Получение контекста из базы знаний для определенного уровня сложности."""
         try:
-            context: LearningContext = state["context"]
-            user_answer = state.get("user_answer")
-            question_data = state.get("generated_question", {})
+            if not self.knowledge_base:
+                return "Базовая информация о рисках непрерывности деятельности банка."
             
-            if not user_answer or not question_data:
-                state["error"] = "Недостаточно данных для оценки"
-                return state
+            # ИСПРАВЛЕНО: формируем разные запросы для разных уровней
+            if difficulty == 1:
+                query = "банковские риски определения основные понятия"
+            elif difficulty == 2:
+                query = "типы угроз риски идентификация процедуры"
+            elif difficulty == 3:
+                query = "оценка рисков воздействие анализ методы"
+            elif difficulty == 4:
+                query = "управление рисками стратегии непрерывность бизнес"
+            else:  # 5
+                query = "регулирование комплаенс сложные сценарии планирование"
             
-            # Оценка правильности ответа
-            correct_answer_index = question_data.get("correct_answer", 0)
-            user_answer_index = int(user_answer) if user_answer.isdigit() else -1
+            # Добавляем темы фокуса
+            if focus_topics:
+                topics_str = " ".join(focus_topics)
+                query += f" {topics_str}"
             
-            is_correct = user_answer_index == correct_answer_index
+            # Ищем релевантные документы
+            docs = await self.knowledge_base.search(query, limit=3)
             
-            # Обновление контекста
-            context.questions_answered += 1
-            if is_correct:
-                context.correct_answers += 1
-                context.consecutive_correct += 1
-                context.consecutive_incorrect = 0
+            if docs:
+                context = "\n\n".join([doc.page_content for doc in docs])
+                logging.info(f"🔍 Найдено {len(docs)} документов для запроса: {query[:50]}...")
+                return context
             else:
-                context.consecutive_incorrect += 1
-                context.consecutive_correct = 0
+                return "Базовая информация о рисках непрерывности деятельности банка."
+                
+        except Exception as e:
+            logging.warning(f"⚠️ Ошибка получения контекста: {e}")
+            return "Базовая информация о рисках непрерывности деятельности банка."
+    
+    async def generate_question_with_llm(
+        self, 
+        difficulty: int, 
+        context: str, 
+        focus_topics: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Генерация вопроса через LLM."""
+        try:
+            if not self.llm:
+                return await self.generate_fallback_question(difficulty)
             
-            # Сохранение результата в историю
-            attempt_record = {
-                "question": question_data.get("question"),
-                "user_answer": user_answer,
-                "correct_answer": correct_answer_index,
-                "is_correct": is_correct,
-                "difficulty": context.current_difficulty,
-                "timestamp": "now"
-            }
-            context.session_history.append(attempt_record)
+            # Формируем промпт для генерации вопроса
+            prompt = self.create_question_prompt(difficulty, context, focus_topics)
             
-            # Сохранение в базу данных
-            await self._save_question_attempt(
-                user_id=context.user_id,
-                question_data=question_data,
-                user_answer=user_answer,
-                is_correct=is_correct
-            )
+            # Вызываем LLM
+            response = await self.llm.ainvoke([HumanMessage(content=prompt)])
+            response_text = response.content.strip()
             
-            state["is_correct"] = is_correct
-            state["evaluation_complete"] = True
+            # Парсим ответ
+            question_data = self.parse_llm_response(response_text, difficulty)
             
-            # Генерация обратной связи
-            if is_correct:
-                feedback = f"✅ Правильно! {question_data.get('explanation', '')}"
+            if question_data and self.validate_question(question_data):
+                return question_data
             else:
-                correct_option = question_data.get('options', [])[correct_answer_index]
-                feedback = f"❌ Неправильно. Правильный ответ: {correct_option}\n\n💡 {question_data.get('explanation', '')}"
-            
-            state["feedback"] = feedback
-            
-            logging.info(f"📊 Ответ пользователя {context.user_id}: {'✅' if is_correct else '❌'}")
-            
-            return state
-            
+                logging.warning("⚠️ LLM сгенерировал некорректный вопрос, используем fallback")
+                return await self.generate_fallback_question(difficulty)
+                
         except Exception as e:
-            logging.error(f"❌ Ошибка оценки ответа: {e}")
-            state["error"] = str(e)
-            return state
+            logging.error(f"❌ Ошибка генерации вопроса через LLM: {e}")
+            return await self.generate_fallback_question(difficulty)
     
-    async def _difficulty_adaptation_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел адаптации сложности."""
+    def create_question_prompt(self, difficulty: int, context: str, focus_topics: List[str]) -> str:
+        """Создание промпта для генерации вопроса."""
+        topics_str = ", ".join(focus_topics)
+        
+        # ИСПРАВЛЕНО: добавляем вариативность и требования к подсказкам
+        import random
+        variation_seed = random.randint(1000, 9999)
+        
+        return f"""
+Создай НОВЫЙ и УНИКАЛЬНЫЙ вопрос для тестирования знаний по управлению рисками непрерывности деятельности банка.
+
+ВАЖНО: Генерируй каждый раз РАЗНЫЕ вопросы! Вариант #{variation_seed}
+
+ПАРАМЕТРЫ:
+- Уровень сложности: {difficulty}/5
+- Темы для фокуса: {topics_str}
+- Тип вопроса: множественный выбор (4 варианта)
+
+ТРЕБОВАНИЯ К СЛОЖНОСТИ:
+Уровень 1: Определения, основные термины (RTO, MTPD)
+Уровень 2: Типы угроз, классификация рисков
+Уровень 3: Процедуры оценки, анализ воздействия
+Уровень 4: Стратегии управления, планирование
+Уровень 5: Комплексные сценарии, регулирование
+
+КОНТЕКСТ:
+{context[:1000]}
+
+ТРЕБОВАНИЯ:
+1. Вопрос должен соответствовать уровню сложности {difficulty}
+2. Включи практические аспекты из банковской деятельности
+3. 4 варианта ответа (только один правильный)
+4. Объяснение должно быть обучающим, НЕ подсказкой к ответу
+5. Вопрос должен проверять понимание, а не память
+
+ФОРМАТ ОТВЕТА (строго JSON):
+{{
+    "question": "Текст вопроса",
+    "options": ["Вариант A", "Вариант B", "Вариант C", "Вариант D"],
+    "correct_answer": 0,
+    "explanation": "Подробное объяснение правильного ответа с дополнительной информацией",
+    "difficulty": {difficulty},
+    "topic": "Название темы"
+}}
+
+Ответь только JSON без дополнительного текста.
+        """
+    
+    def parse_llm_response(self, response_text: str, difficulty: int) -> Optional[Dict[str, Any]]:
+        """Парсинг ответа LLM."""
         try:
-            context: LearningContext = state["context"]
+            # Пытаемся извлечь JSON из ответа
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
             
-            # Логика адаптации сложности
-            adaptation_made = False
+            if start_idx != -1 and end_idx != -1:
+                json_str = response_text[start_idx:end_idx]
+                question_data = json.loads(json_str)
+                
+                # Проверяем обязательные поля
+                required_fields = ["question", "options", "correct_answer", "explanation"]
+                if all(field in question_data for field in required_fields):
+                    question_data["difficulty"] = difficulty
+                    return question_data
             
-            # Увеличиваем сложность при серии правильных ответов
-            if context.consecutive_correct >= 2 and context.current_difficulty < 5:
-                context.current_difficulty = min(context.current_difficulty + 1, 5)
-                adaptation_made = True
-                state["adaptation_message"] = f"🎯 Уровень повышен до {DifficultyConfig.LEVEL_NAMES[context.current_difficulty]}!"
+            return None
             
-            # Уменьшаем сложность при серии неправильных ответов
-            elif context.consecutive_incorrect >= 2 and context.current_difficulty > 1:
-                context.current_difficulty = max(context.current_difficulty - 1, 1)
-                adaptation_made = True
-                state["adaptation_message"] = f"📚 Уровень понижен до {DifficultyConfig.LEVEL_NAMES[context.current_difficulty]} для лучшего усвоения"
-            
-            state["adaptation_made"] = adaptation_made
-            state["current_difficulty"] = context.current_difficulty
-            
-            logging.info(f"🎯 Адаптация для пользователя {context.user_id}: уровень {context.current_difficulty}")
-            
-            return state
-            
+        except json.JSONDecodeError as e:
+            logging.warning(f"⚠️ Ошибка парсинга JSON ответа LLM: {e}")
+            return None
         except Exception as e:
-            logging.error(f"❌ Ошибка адаптации сложности: {e}")
-            state["error"] = str(e)
-            return state
+            logging.error(f"❌ Ошибка обработки ответа LLM: {e}")
+            return None
     
-    async def _lesson_completion_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел завершения урока."""
+    def validate_question(self, question_data: Dict[str, Any]) -> bool:
+        """Валидация сгенерированного вопроса."""
         try:
-            context: LearningContext = state["context"]
+            # Проверяем обязательные поля
+            if not question_data.get("question") or len(question_data["question"]) < 10:
+                return False
             
-            # Расчет результатов урока
-            success_rate = context.correct_answers / max(context.questions_answered, 1) * 100
+            options = question_data.get("options", [])
+            if len(options) != 4:
+                return False
             
-            # Определение статуса завершения
-            lesson_passed = success_rate >= settings.min_lesson_score
+            correct_answer = question_data.get("correct_answer")
+            if not isinstance(correct_answer, int) or correct_answer < 0 or correct_answer >= 4:
+                return False
             
-            completion_data = {
-                "lesson_passed": lesson_passed,
-                "success_rate": success_rate,
-                "questions_answered": context.questions_answered,
-                "correct_answers": context.correct_answers,
-                "final_difficulty": context.current_difficulty
-            }
+            if not question_data.get("explanation") or len(question_data["explanation"]) < 10:
+                return False
             
-            # Сообщение о завершении
-            if lesson_passed:
-                message = f"🎉 Урок завершен успешно!\n📊 Результат: {success_rate:.1f}%"
-            else:
-                message = f"📚 Необходимо повторение\n📊 Результат: {success_rate:.1f}% (требуется {settings.min_lesson_score}%)"
-            
-            state["completion_data"] = completion_data
-            state["completion_message"] = message
-            
-            # Сохранение прогресса
-            await self._save_lesson_progress(context.user_id, completion_data)
-            
-            logging.info(f"🏁 Урок завершен для пользователя {context.user_id}: {success_rate:.1f}%")
-            
-            return state
+            return True
             
         except Exception as e:
-            logging.error(f"❌ Ошибка завершения урока: {e}")
-            state["error"] = str(e)
-            return state
+            logging.warning(f"⚠️ Ошибка валидации вопроса: {e}")
+            return False
     
-    async def _topic_transition_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Узел перехода к следующей теме."""
-        try:
-            context: LearningContext = state["context"]
-            
-            # Логика выбора следующей темы на основе прогресса
-            # Это упрощенная версия - в реальности нужна более сложная логика
-            
-            next_topic_id = None
-            if context.current_topic_id:
-                next_topic_id = context.current_topic_id + 1
-            
-            state["next_topic_id"] = next_topic_id
-            state["transition_complete"] = True
-            
-            logging.info(f"🔄 Переход к теме {next_topic_id} для пользователя {context.user_id}")
-            
-            return state
-            
-        except Exception as e:
-            logging.error(f"❌ Ошибка перехода к теме: {e}")
-            state["error"] = str(e)
-            return state
-    
-    # Функции маршрутизации
-    def _route_after_evaluation(self, state: Dict[str, Any]) -> str:
-        """Маршрутизация после оценки ответа."""
-        context: LearningContext = state["context"]
-        
-        # Завершаем урок после определенного количества вопросов
-        if context.questions_answered >= settings.questions_per_lesson:
-            return "complete_lesson"
-        
-        # Переходим к следующей теме при высоких результатах
-        if context.consecutive_correct >= 3 and context.current_difficulty >= 4:
-            return "next_topic"
-        
-        # Продолжаем с адаптацией сложности
-        return "continue"
-    
-    def _route_after_adaptation(self, state: Dict[str, Any]) -> str:
-        """Маршрутизация после адаптации сложности."""
-        context: LearningContext = state["context"]
-        
-        # Завершаем урок если достигли лимита вопросов
-        if context.questions_answered >= settings.questions_per_lesson:
-            return "complete_lesson"
-        
-        # Продолжаем генерацию вопросов
-        return "continue"
-    
-    # Вспомогательные методы
-    def _create_fallback_question(self, difficulty: int) -> Dict[str, Any]:
-        """Создание резервного вопроса при ошибке генерации."""
+    async def generate_fallback_question(self, difficulty: int) -> Dict[str, Any]:
+        """Генерация резервного вопроса при ошибке LLM."""
         fallback_questions = {
-            1: {
-                "question": "Что означает аббревиатура RTO в контексте управления рисками?",
-                "options": [
-                    "Время восстановления процесса",
-                    "Реальное время операций", 
-                    "Результат технической оценки",
-                    "Режим текущей операции"
-                ],
-                "correct_answer": 0,
-                "explanation": "RTO (Recovery Time Objective) - это целевое время восстановления процесса после реализации угрозы непрерывности.",
-                "difficulty": 1,
-                "topic": "Основные понятия"
-            }
+            1: [
+                {
+                    "question": "Что означает аббревиатура RTO в контексте управления рисками непрерывности?",
+                    "options": [
+                        "Время восстановления операций",
+                        "Риск технических операций", 
+                        "Регулярная техническая оценка",
+                        "Расчет текущих обязательств"
+                    ],
+                    "correct_answer": 0,
+                    "explanation": "RTO (Recovery Time Objective) - это целевое время восстановления процесса после инцидента.",
+                    "topic": "Основные термины"
+                },
+                {
+                    "question": "Что такое MTPD в управлении рисками непрерывности?",
+                    "options": [
+                        "Максимально допустимый период простоя",
+                        "Минимальное время подготовки данных",
+                        "Максимальный темп производственных данных",
+                        "Методы технического планирования данных"
+                    ],
+                    "correct_answer": 0,
+                    "explanation": "MTPD (Maximum Tolerable Period of Disruption) - максимально допустимый период нарушения процесса.",
+                    "topic": "Основные термины"
+                }
+            ],
+            2: [
+                {
+                    "question": "Какие из перечисленных угроз относятся к техногенным рискам?",
+                    "options": [
+                        "Землетрясения и наводнения",
+                        "Пожары и аварии оборудования",
+                        "Экономические кризисы",
+                        "Социальные беспорядки"
+                    ],
+                    "correct_answer": 1,
+                    "explanation": "Техногенные угрозы - это риски, связанные с технической деятельностью человека, включая пожары, аварии оборудования, техногенные катастрофы.",
+                    "topic": "Типы угроз"
+                },
+                {
+                    "question": "К какому типу угроз относятся забастовки и беспорядки?",
+                    "options": [
+                        "Природные",
+                        "Техногенные",
+                        "Социальные",
+                        "Экономические"
+                    ],
+                    "correct_answer": 2,
+                    "explanation": "Забастовки и социальные беспорядки относятся к социальным угрозам, которые могут нарушить деятельность банка.",
+                    "topic": "Типы угроз"
+                }
+            ],
+            3: [
+                {
+                    "question": "При оценке воздействия на бизнес (BIA) в первую очередь определяют:",
+                    "options": [
+                        "Стоимость восстановительных работ",
+                        "Критически важные бизнес-процессы",
+                        "Количество сотрудников в подразделении",
+                        "Размер страховых выплат"
+                    ],
+                    "correct_answer": 1,
+                    "explanation": "Анализ воздействия на бизнес начинается с выявления критически важных процессов, без которых банк не может функционировать.",
+                    "topic": "Анализ воздействия"
+                },
+                {
+                    "question": "Что включает в себя процедура оценки риска?",
+                    "options": [
+                        "Только расчет финансовых потерь",
+                        "Идентификацию, анализ и оценку рисков",
+                        "Только выбор методов защиты",
+                        "Только составление отчетности"
+                    ],
+                    "correct_answer": 1,
+                    "explanation": "Процедура оценки риска включает три этапа: идентификацию угроз, анализ их воздействия и оценку уровня риска.",
+                    "topic": "Оценка рисков"
+                }
+            ],
+            4: [
+                {
+                    "question": "Основная цель планов обеспечения непрерывности бизнеса:",
+                    "options": [
+                        "Полное предотвращение всех рисков",
+                        "Минимизация времени восстановления критических процессов",
+                        "Максимизация прибыли",
+                        "Сокращение штата сотрудников"
+                    ],
+                    "correct_answer": 1,
+                    "explanation": "Планы обеспечения непрерывности бизнеса направлены на быстрое восстановление критически важных процессов после инцидента.",
+                    "topic": "Планирование непрерывности"
+                }
+            ],
+            5: [
+                {
+                    "question": "Какие требования предъявляет Банк России к управлению операционными рисками?",
+                    "options": [
+                        "Только ведение статистики инцидентов",
+                        "Комплексную систему управления рисками с регулярной отчетностью",
+                        "Только страхование от всех рисков",
+                        "Только назначение ответственного сотрудника"
+                    ],
+                    "correct_answer": 1,
+                    "explanation": "Банк России требует создания комплексной системы управления операционными рисками с процедурами выявления, оценки, контроля и отчетности.",
+                    "topic": "Регулирование"
+                }
+            ]
         }
         
-        return fallback_questions.get(difficulty, fallback_questions[1])
+        # ИСПРАВЛЕНО: выбираем случайный вопрос из доступных для уровня
+        questions_for_level = fallback_questions.get(difficulty, fallback_questions[1])
+        import random
+        question = random.choice(questions_for_level).copy()
+        question["difficulty"] = difficulty
+        
+        logging.info(f"🔄 Использован резервный вопрос уровня {difficulty}")
+        return question
     
-    async def _save_question_attempt(self, user_id: int, question_data: Dict, user_answer: str, is_correct: bool):
-        """Сохранение попытки ответа в базе данных."""
+    async def generate_simple_question(
+        self, 
+        user_id: int, 
+        difficulty: int, 
+        focus_topics: List[str]
+    ) -> Dict[str, Any]:
+        """Простая генерация вопроса без LangGraph."""
         try:
-            from database.models import QuestionAttempt
-            from database.database import db_manager
+            # Получаем контекст
+            context = await self.get_context_for_difficulty(difficulty, focus_topics)
             
-            async with db_manager.get_session() as session:
-                attempt = QuestionAttempt(
-                    user_id=user_id,
-                    question_id=None,  # Для сгенерированных вопросов
-                    user_answer=user_answer,
-                    is_correct=is_correct,
-                    ai_feedback=question_data.get("explanation"),
-                    time_spent_seconds=None
-                )
-                session.add(attempt)
-                await session.commit()
+            # Генерируем вопрос
+            if self.llm:
+                question_data = await self.generate_question_with_llm(difficulty, context, focus_topics)
+            else:
+                question_data = await self.generate_fallback_question(difficulty)
+            
+            if question_data:
+                return {
+                    "success": True,
+                    "generated_question": question_data,
+                    "difficulty": difficulty,
+                    "focus_topics": focus_topics
+                }
+            else:
+                return {"error": "Не удалось сгенерировать вопрос"}
                 
         except Exception as e:
-            logging.error(f"❌ Ошибка сохранения попытки: {e}")
+            logging.error(f"❌ Ошибка простой генерации вопроса: {e}")
+            return {"error": str(e)}
     
-    async def _save_lesson_progress(self, user_id: int, completion_data: Dict):
-        """Сохранение прогресса урока."""
-        try:
-            from database.models import UserProgress
-            from database.database import db_manager
-            
-            async with db_manager.get_session() as session:
-                # Здесь должна быть логика сохранения прогресса
-                # Упрощенная версия
-                pass
-                
-        except Exception as e:
-            logging.error(f"❌ Ошибка сохранения прогресса: {e}")
+    async def process_answer(self, state: LearningState) -> LearningState:
+        """Обработка ответа пользователя."""
+        # Эта функция будет вызываться из lesson_handler
+        return state
     
-    def get_user_context(self, user_id: int) -> Optional[LearningContext]:
-        """Получение контекста пользователя."""
-        return self.contexts.get(user_id)
+    async def adapt_difficulty(self, state: LearningState) -> LearningState:
+        """Адаптация сложности на основе ответа."""
+        # Логика адаптации теперь в ProgressService
+        return state
     
-    def clear_user_context(self, user_id: int):
-        """Очистка контекста пользователя."""
-        if user_id in self.contexts:
-            del self.contexts[user_id]
+    async def check_session_completion(self, state: LearningState) -> LearningState:
+        """Проверка завершения сессии."""
+        if state["question_count"] >= self.questions_per_session:
+            state["session_active"] = False
+        return state
+    
+    def should_continue(self, state: LearningState) -> str:
+        """Определение продолжения сессии."""
+        return "continue" if state["session_active"] else "end"
