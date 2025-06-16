@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.env
+*.db
+*.sqlite3
+*.log
+.DS_Store
+
+# AI/ML
+ai_agent/rag/data/vectorstore/
+models/
+
+# IDE
+.vscode/
+.idea/
